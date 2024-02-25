@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from ruamel.yaml import YAML, dump, RoundTripDumper
-
+import io
 #
 import os
 import math
@@ -15,10 +15,13 @@ from stable_baselines import logger
 from rpg_baselines.common.policies import MlpPolicy
 from rpg_baselines.ppo.ppo2 import PPO2
 from rpg_baselines.ppo.ppo2_test import test_model
+from rpg_baselines.vpg.vpg import VPG
+
 from rpg_baselines.envs import vec_env_wrapper as wrapper
 import rpg_baselines.common.util as U
 #
 from flightgym import QuadrotorEnv_v1
+
 
 
 def configure_random_seed(seed, env=None):
@@ -40,6 +43,8 @@ def parser():
                         help="Random seed")
     parser.add_argument('-w', '--weight', type=str, default='./saved/quadrotor_env.zip',
                         help='trained weight path')
+    parser.add_argument('--model', type=str, default='PPO',
+                        help="Model name")
     return parser
 
 
@@ -56,8 +61,20 @@ def main():
     else:
         cfg["env"]["render"] = "no"
 
-    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(
-        dump(cfg, Dumper=RoundTripDumper), False))
+    # env = wrapper.FlightEnvVec(QuadrotorEnv_v1(
+    #     dump(cfg, Dumper=RoundTripDumper), False))
+
+
+    yaml = YAML()
+    cfg_str = io.StringIO()
+    yaml.dump(cfg, cfg_str)
+    cfg_str.seek(0)
+    cfg_yaml_str = cfg_str.read()
+
+    env = wrapper.FlightEnvVec(QuadrotorEnv_v1(cfg_yaml_str, False))
+
+
+
 
     # set random seed
     configure_random_seed(args.seed, env=env)
@@ -68,25 +85,45 @@ def main():
         rsg_root = os.path.dirname(os.path.abspath(__file__))
         log_dir = rsg_root + '/saved'
         saver = U.ConfigurationSaver(log_dir=log_dir)
-        model = PPO2(
-            tensorboard_log=saver.data_dir,
-            policy=MlpPolicy,  # check activation function
-            policy_kwargs=dict(
-                net_arch=[dict(pi=[128, 128], vf=[128, 128])], act_fun=tf.nn.relu),
-            env=env,
-            lam=0.95,
-            gamma=0.99,  # lower 0.9 ~ 0.99
-            # n_steps=math.floor(cfg['env']['max_time'] / cfg['env']['ctl_dt']),
-            n_steps=250,
-            ent_coef=0.00,
-            learning_rate=3e-4,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            nminibatches=1,
-            noptepochs=10,
-            cliprange=0.2,
-            verbose=1,
-        )
+        if args.model == "PPO":
+            model = PPO2(
+                tensorboard_log=saver.data_dir,
+                policy=MlpPolicy,  # check activation function
+                policy_kwargs=dict(
+                    net_arch=[dict(pi=[128, 128], vf=[128, 128])], act_fun=tf.nn.relu),
+                env=env,
+                lam=0.95,
+                gamma=0.99,  # lower 0.9 ~ 0.99
+                # n_steps=math.floor(cfg['env']['max_time'] / cfg['env']['ctl_dt']),
+                n_steps=250,
+                ent_coef=0.00,
+                learning_rate=3e-4,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                nminibatches=1,
+                noptepochs=10,
+                cliprange=0.2,
+                verbose=1,
+            )
+        elif args.model == "VPG":
+            model = VPG(
+                tensorboard_log=saver.data_dir,
+                policy=MlpPolicy,  # check activation function
+                policy_kwargs=dict(
+                    net_arch=[dict(pi=[128, 128], vf=[128, 128])], act_fun=tf.nn.relu),
+                env=env,
+                lam=0.95,
+                gamma=0.99,  # lower 0.9 ~ 0.99
+                # n_steps=math.floor(cfg['env']['max_time'] / cfg['env']['ctl_dt']),
+                n_steps=250,
+                ent_coef=0.01,
+                learning_rate=3e-4,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                nminibatches=1,
+                noptepochs=10,
+                verbose=1,
+            )
 
         # tensorboard
         # Make sure that your chrome browser is already on.

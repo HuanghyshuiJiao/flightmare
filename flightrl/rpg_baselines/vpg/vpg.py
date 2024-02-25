@@ -15,10 +15,9 @@ from stable_baselines.common.math_util import safe_mean
 from rpg_baselines.common.policies import ActorCriticPolicy, RecurrentActorCriticPolicy
 
 
-class PPO2(ActorCriticRLModel):
+class VPG(ActorCriticRLModel):
     """
-    Proximal Policy Optimization algorithm (GPU version).
-    Paper: https://arxiv.org/abs/1707.06347
+    Vanila Policy Gradiant algorithm.
 
     :param policy: (ActorCriticPolicy or str) The policy model to use (MlpPolicy, CnnPolicy, CnnLstmPolicy, ...)
     :param env: (Gym environment or str) The environment to learn from (if registered in Gym, can be str)
@@ -33,13 +32,6 @@ class PPO2(ActorCriticRLModel):
     :param nminibatches: (int) Number of training minibatches per update. For recurrent policies,
         the number of environments run in parallel should be a multiple of nminibatches.
     :param noptepochs: (int) Number of epoch when optimizing the surrogate
-    :param cliprange: (float or callable) Clipping parameter, it can be a function
-    :param cliprange_vf: (float or callable) Clipping parameter for the value function, it can be a function.
-        This is a parameter specific to the OpenAI implementation. If None is passed (default),
-        then `cliprange` (that is used for the policy) will be used.
-        IMPORTANT: this clipping depends on the reward scaling.
-        To deactivate value function clipping (and recover the original PPO implementation),
-        you have to pass a negative value (e.g. -1).
     :param verbose: (int) the verbosity level: 0 none, 1 training information, 2 tensorflow debug
     :param tensorboard_log: (str) the log location for tensorboard (if None, no logging)
     :param _init_setup_model: (bool) Whether or not to build the network at the creation of the instance
@@ -108,7 +100,7 @@ class PPO2(ActorCriticRLModel):
     def setup_model(self):
         with SetVerbosity(self.verbose):
 
-            assert issubclass(self.policy, ActorCriticPolicy), "Error: the input policy for the PPO2 model must be " \
+            assert issubclass(self.policy, ActorCriticPolicy), "Error: the input policy for the VPG model must be " \
                                                                "an instance of common.policies.ActorCriticPolicy."
 
             self.n_batch = self.n_envs * self.n_steps
@@ -136,7 +128,6 @@ class PPO2(ActorCriticRLModel):
 
                 with tf.variable_scope("loss", reuse=False):
                     self.action_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
-                    self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
                     self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
                     self.old_neglog_pac_ph = tf.placeholder(tf.float32, [None], name="old_neglog_pac_ph")
                     self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
@@ -147,14 +138,15 @@ class PPO2(ActorCriticRLModel):
                     # neglogpac = tf.reduce_sum( tf.log(1-self.action_ph**2+1e-6), axis=1) - neglogpac_u
                     self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
 
+                    vpred = train_model.value_flat
+                    self.vf_loss = tf.reduce_mean(tf.square(vpred - self.rewards_ph))
 
-                    ratio = tf.exp(self.old_neglog_pac_ph - neglogpac)
-                    self.pg_loss = -self.advs_ph * ratio
+                    self.pg_loss = -tf.reduce_mean(self.rewards_ph * neglogpac)
 
                     self.approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - self.old_neglog_pac_ph))
 
                     # self.kl_loss = tf.maximum(tf.reduce_mean(self.approxkl - 0.02 ), 0.0 )
-                    loss = self.pg_loss - self.entropy * self.ent_coef   # + self.kl_loss
+                    loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef  # + self.kl_loss
 
                     tf.summary.scalar('entropy_loss', self.entropy)
                     tf.summary.scalar('policy_gradient_loss', self.pg_loss)
@@ -179,9 +171,6 @@ class PPO2(ActorCriticRLModel):
                 with tf.variable_scope("input_info", reuse=False):
                     tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
                     tf.summary.scalar('learning_rate', tf.reduce_mean(self.learning_rate_ph))
-                    tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
-
-
                     tf.summary.scalar('old_neglog_action_probability', tf.reduce_mean(self.old_neglog_pac_ph))
                     tf.summary.scalar('old_value_pred', tf.reduce_mean(self.old_vpred_ph))
 
@@ -209,7 +198,7 @@ class PPO2(ActorCriticRLModel):
     def _train_step(self, learning_rate,  obs, returns, masks, actions, values, neglogpacs, update,
                     writer, states=None):
         """
-        Training of PPO2 Algorithm
+        Training of VPG Algorithm
 
         :param learning_rate: (float) learning rate
         :param obs: (np.ndarray) The current observation of the environment
@@ -224,11 +213,9 @@ class PPO2(ActorCriticRLModel):
         :return: policy gradient loss, value function loss, policy entropy,
                 approximation of kl divergence,  training update operation
         """
-        advs = returns - values
-        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+
         td_map = {self.train_model.obs_ph: obs, self.action_ph: actions,
-                  self.advs_ph: advs, self.rewards_ph: returns,
-                  self.learning_rate_ph: learning_rate,
+                  self.rewards_ph: returns, self.learning_rate_ph: learning_rate,
                   self.old_neglog_pac_ph: neglogpacs, self.old_vpred_ph: values}
         if states is not None:
             td_map[self.train_model.states_ph] = states
@@ -245,23 +232,23 @@ class PPO2(ActorCriticRLModel):
             if self.full_tensorboard_log and (1 + update) % 10 == 0:
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                 run_metadata = tf.RunMetadata()
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, policy_entropy, approxkl, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self._train],
                     td_map, options=run_options, run_metadata=run_metadata)
                 writer.add_run_metadata(run_metadata, 'step%d' % (update * update_fac))
             else:
-                summary, policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train],
+                summary, policy_loss, value_loss, policy_entropy, approxkl, _ = self.sess.run(
+                    [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self._train],
                     td_map)
             writer.add_summary(summary, (update * update_fac))
         else:
-            policy_loss, value_loss, policy_entropy, approxkl, clipfrac, _ = self.sess.run(
-                [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self.clipfrac, self._train], td_map)
+            policy_loss, value_loss, policy_entropy, approxkl, _ = self.sess.run(
+                [self.pg_loss, self.vf_loss, self.entropy, self.approxkl, self._train], td_map)
 
-        return policy_loss, value_loss, policy_entropy, approxkl, clipfrac
+        return policy_loss, value_loss, policy_entropy, approxkl
 
     def learn(self, total_timesteps, log_dir, logger,
-              callback=None, log_interval=1, tb_log_name="PPO2",
+              callback=None, log_interval=1, tb_log_name="VPG",
               reset_num_timesteps=True):
         # Transform to callable if needed
         self.learning_rate = get_schedule_fn(self.learning_rate)
