@@ -128,6 +128,7 @@ class VPG(ActorCriticRLModel):
 
                 with tf.variable_scope("loss", reuse=False):
                     self.action_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
+                    self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
                     self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
                     self.old_neglog_pac_ph = tf.placeholder(tf.float32, [None], name="old_neglog_pac_ph")
                     self.old_vpred_ph = tf.placeholder(tf.float32, [None], name="old_vpred_ph")
@@ -141,12 +142,12 @@ class VPG(ActorCriticRLModel):
                     vpred = train_model.value_flat
                     self.vf_loss = tf.reduce_mean(tf.square(vpred - self.rewards_ph))
 
-                    self.pg_loss = -tf.reduce_mean(self.rewards_ph * neglogpac)
+                    self.pg_loss = tf.reduce_mean(self.advs_ph * neglogpac)
 
                     self.approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - self.old_neglog_pac_ph))
 
-                    # self.kl_loss = tf.maximum(tf.reduce_mean(self.approxkl - 0.02 ), 0.0 )
-                    loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef  # + self.kl_loss
+                    self.kl_loss = tf.maximum(tf.reduce_mean(self.approxkl - 0.02 ), 0.0 )
+                    loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef + self.kl_loss
 
                     tf.summary.scalar('entropy_loss', self.entropy)
                     tf.summary.scalar('policy_gradient_loss', self.pg_loss)
@@ -171,6 +172,7 @@ class VPG(ActorCriticRLModel):
                 with tf.variable_scope("input_info", reuse=False):
                     tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
                     tf.summary.scalar('learning_rate', tf.reduce_mean(self.learning_rate_ph))
+                    tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
                     tf.summary.scalar('old_neglog_action_probability', tf.reduce_mean(self.old_neglog_pac_ph))
                     tf.summary.scalar('old_value_pred', tf.reduce_mean(self.old_vpred_ph))
 
@@ -214,8 +216,11 @@ class VPG(ActorCriticRLModel):
                 approximation of kl divergence,  training update operation
         """
 
+        advs = returns - values
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
         td_map = {self.train_model.obs_ph: obs, self.action_ph: actions,
-                  self.rewards_ph: returns, self.learning_rate_ph: learning_rate,
+                  self.advs_ph: advs, self.rewards_ph: returns,
+                  self.learning_rate_ph: learning_rate,
                   self.old_neglog_pac_ph: neglogpacs, self.old_vpred_ph: values}
         if states is not None:
             td_map[self.train_model.states_ph] = states
@@ -459,12 +464,19 @@ class Runner(AbstractEnvRunner):
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
         last_values = self.model.value(self.obs, self.states, self.dones)
         # discount/bootstrap off value fn
-
+        mb_advs = np.zeros_like(mb_rewards)
         true_reward = np.copy(mb_rewards)
-        mb_returns = np.zeros_like(mb_rewards)
-        mb_returns[self.n_steps - 1] = mb_rewards[self.n_steps - 1]
-        for step in reversed(range(self.n_steps - 1)):
-            mb_returns[step] = mb_rewards[step] + self.gamma * mb_returns[step + 1] * (1 - mb_dones[step])
+        last_gae_lam = 0
+        for step in reversed(range(self.n_steps)):
+            if step == self.n_steps - 1:
+                nextnonterminal = 1.0 - self.dones
+                nextvalues = last_values
+            else:
+                nextnonterminal = 1.0 - mb_dones[step + 1]
+                nextvalues = mb_values[step + 1]
+            delta = mb_rewards[step] + self.gamma * nextvalues * nextnonterminal - mb_values[step]
+            mb_advs[step] = last_gae_lam = delta + self.gamma * self.lam * nextnonterminal * last_gae_lam
+        mb_returns = mb_advs + mb_values
 
         mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward = \
             map(swap_and_flatten, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs, true_reward))
